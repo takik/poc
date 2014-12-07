@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:int="http://www.springframework.org/schema/integration"
+	xmlns:int-file="http://www.springframework.org/schema/integration/file"
+	xmlns:task="http://www.springframework.org/schema/task" xmlns:int-mail="http://www.springframework.org/schema/integration/mail"
+	xmlns:util="http://www.springframework.org/schema/util"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans
+						http://www.springframework.org/schema/beans/spring-beans.xsd
+						http://www.springframework.org/schema/integration
+						http://www.springframework.org/schema/integration/spring-integration.xsd
+						http://www.springframework.org/schema/integration/file
+						http://www.springframework.org/schema/integration/file/spring-integration-file.xsd
+						http://www.springframework.org/schema/task
+						http://www.springframework.org/schema/task/spring-task.xsd
+						http://www.springframework.org/schema/integration/mail
+   						http://www.springframework.org/schema/integration/mail/spring-integration-mail.xsd
+   						http://www.springframework.org/schema/util 
+   						http://www.springframework.org/schema/util/spring-util.xsd">
+
+
+	<bean
+		class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+		<property name="locations">
+			<list>
+				<value>classpath:/META-INF/spring-integration-file-demo.properties</value>
+			</list>
+		</property>
+		<property name="ignoreResourceNotFound" value="true" />
+	</bean>
+	<!--polling a folder each 5 seconds -->
+	<int-file:inbound-channel-adapter id="filesIn"
+		directory="${polling.dir}" filename-pattern="${filename-pattern}"
+		prevent-duplicates="true">
+		<int:poller id="poller" fixed-rate="5000"
+			max-messages-per-poll="${max-messages-per-poll}" />
+	</int-file:inbound-channel-adapter>
+
+	<!-- Split input List<File> out put File -->
+	<int:splitter id="singleFile" input-channel="filesIn"
+		output-channel="singleFileChannel" />
+
+	<int:channel id="singleFileChannel" />
+
+	<!-- File with size > 10000 byte will be discarted -->
+	<int:filter input-channel="singleFileChannel" expression="!(payload.length() > ${max-file-payload-size})"
+		discard-channel="bigFilesOut" output-channel="headerEnricherChannel" />
+
+	<int:channel id="headerEnricherChannel" />
+	<!--Enrich the Header message with the extension information in order to 
+		root message later -->
+	<int:header-enricher input-channel="headerEnricherChannel"
+		output-channel="bytesChannel">
+		<int:header name="file_extension"
+			expression="payload.getName().substring(payload.getName().lastIndexOf('.'))" />
+	</int:header-enricher>
+
+	<int:channel id="bytesChannel" />
+
+	<!-- Delete Source File and convert it into byte array -->
+	<int-file:file-to-bytes-transformer
+		input-channel="bytesChannel" output-channel="routingChannel"
+		delete-files="true" />
+
+	<!-- log any message coming into the routingChannel -->
+	<!-- Logging -->
+	<int:logging-channel-adapter id="loggingChannel"
+		level="INFO"
+		expression="'Processing file: ' + headers.file_name + ' (' + payload.length + ' bytes) '" />
+
+	<int:channel id="routingChannel">
+		<int:interceptors>
+			<int:wire-tap channel="loggingChannel" />
+		</int:interceptors>
+	</int:channel>
+	<!-- Messages Rooting based on the extension of input file -->
+	<int:header-value-router id="fileTypeRouter"
+		default-output-channel="otherFilesOut" header-name="file_extension"
+		input-channel="routingChannel" resolution-required="false">
+		<int:mapping value=".csv" channel="parallelMessageChannel" />
+		<int:mapping value=".xlsx" channel="xlsxToCsvChannel" />
+	</int:header-value-router>
+
+	<!-- Parallel Run & Copying the message into multiple channel -->
+	<task:executor id="copyMessageExecutor" pool-size="10" />
+	<int:publish-subscribe-channel id="parallelMessageChannel"
+		task-executor="copyMessageExecutor" />
+
+	<int:channel id="xlsxToCsvChannel" />
+
+	<!--Spring Integration Mail notify -->
+	<!-- First Suscriber to parallelMessageChannel Send Mail with the csv file 
+		in attachement -->
+	<int-mail:header-enricher input-channel="parallelMessageChannel"
+		output-channel="notifyProcessingFile">
+		<int-mail:from value="${int-mail-from}" />
+		<int-mail:subject
+			expression="'The Csv File: ' + headers.file_name +' was processed in success !'" />
+		<int-mail:to value="${int-mail-to}" />
+		<int-mail:attachment-filename expression="headers.file_name" />
+	</int-mail:header-enricher>
+
+	<int-mail:outbound-channel-adapter
+		id="notifyProcessingFile" host="${mail.smtp.host}" username="${mail.smtp.username}"
+		password="${mail.smtp.password}" java-mail-properties="javaMailProperties" />
+
+	<util:properties id="javaMailProperties">
+		<prop key="mail.smtp.starttls.enable">${mail.smtp.starttls.enable}</prop>
+		<prop key="mail.debug">${mail.debug}</prop>
+		<prop key="mail.transport.protocol">${mail.transport.protocol}</prop>
+		<prop key="mail.smtp.host">${mail.smtp.host}</prop>
+		<prop key="mail.smtp.port">${mail.smtp.port}</prop>
+	</util:properties>
+
+	<!-- Second Suscriber to parallelMessageChannel Read CSV File Content -->
+	<int:service-activator input-channel="parallelMessageChannel"
+		ref="csvFileReader" />
+
+
+	<!-- Third Suscriber to parallelMessageChannel Zip -->
+	<int:transformer input-channel="parallelMessageChannel"
+		output-channel="zipFilesOut" ref="byteArrayToZipTransformer" method="zip" />
+
+	<int:transformer input-channel="xlsxToCsvChannel"
+		output-channel="parallelMessageChannel" ref="xlsxByteArray2CsvTransformer" />
+
+	<!-- output files -->
+	<int-file:outbound-channel-adapter
+		id="zipFilesOut" directory="${zip.files.out}"
+		delete-source-files="true" />
+
+	<int-file:outbound-channel-adapter
+		id="bigFilesOut" directory="${big.file.out}"
+		delete-source-files="true" />
+
+	<int-file:outbound-channel-adapter
+		id="otherFilesOut" directory="${other.files.out}"
+		delete-source-files="true" />
+</beans>
